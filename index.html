@@ -1804,7 +1804,9 @@
     URL.revokeObjectURL(url);
   }
   function exportJSON(){
-    downloadBlob(JSON.stringify({wallets, transactions:txs, budgets, goals, installmentPlans, settlements}, null, 2), 'ledger-backup-'+todayStr()+'.json', 'application/json');
+    const snapshot = {exportedAt:new Date().toISOString(), netWorth:Math.round(netWorth()*100)/100, walletCount:wallets.length, txCount:txs.length,
+      balances:Object.fromEntries(wallets.map(w=>[w.id, Math.round(walletBalance(w)*100)/100]))};
+    downloadBlob(JSON.stringify({snapshot, wallets, transactions:txs, budgets, goals, installmentPlans, settlements, loans}, null, 2), 'ledger-backup-'+todayStr()+'.json', 'application/json');
   }
   function exportCSV(){
     const header = ['Date','Wallet','Type','Category','Amount','Note','Reimbursable','Reimbursed Amount','Loaned Out','Repaid Amount','Has Receipt'];
@@ -1840,8 +1842,20 @@
         goals = data.goals || [];
         installmentPlans = data.installmentPlans || [];
         settlements = data.settlements || [];
+        loans = data.loans || [];
         persist();
         render();
+        const nowNW = Math.round(netWorth()*100)/100;
+        let msg = 'Imported '+wallets.length+' wallets and '+txs.length+' transactions.\nNet worth now: '+fmt(nowNW);
+        if(data.snapshot && typeof data.snapshot.netWorth==='number'){
+          const bad = wallets.filter(w=> data.snapshot.balances && data.snapshot.balances[w.id]!=null && Math.abs(data.snapshot.balances[w.id]-walletBalance(w))>0.005);
+          msg += Math.abs(data.snapshot.netWorth-nowNW)<=0.005 && !bad.length
+            ? '\n\n✓ Matches the file exactly ('+fmt(data.snapshot.netWorth)+').'
+            : '\n\n⚠ The file recorded '+fmt(data.snapshot.netWorth)+'. Differences: '+(bad.length ? bad.map(w=>w.name).join(', ') : 'check dated entries (balances are as of today).');
+        } else {
+          msg += '\n\nCompare this with the net worth shown in your old file.';
+        }
+        setTimeout(()=>alert(msg), 50);
       }catch(err){
         alert('Could not read that file — make sure it is a Ledger JSON export.');
       }
