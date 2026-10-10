@@ -535,6 +535,7 @@
     {id:'reimbursement_in', name:'Reimbursement Received', color:'#AD8730', trueIncome:false},
     {id:'repayment_in', name:'Loan Repayment Received', color:'#4F7A82', trueIncome:false},
     {id:'family_support', name:'Family Support', color:'#8A6A9C', trueIncome:false},
+    {id:'borrowed_in', name:'Borrowed Money', color:'#8A5A44', trueIncome:false},
     {id:'refund_in', name:'Refund', color:'#7A6A46', trueIncome:false},
     {id:'income', name:'Income (legacy)', color:'#4B6B3A', trueIncome:true},
     {id:'transfer', name:'Transfer', color:'#8A7F6C'},
@@ -644,6 +645,24 @@
   let pasteSetupValue = '';
   let syncPushTimer = null;
   const CLOUD_CONFIG_KEY = 'ledger:cloud-config';
+  const GH_CONFIG_KEY = 'ledger:gh-config';
+  const UPDATED_KEY = 'ledger:updatedAt';
+  let ghRepo = null, ghToken = null, ghPath = 'ledger-data.json', ghSha = null, lastPullAt = 0;
+  function ghConfigured(){ return !!(ghRepo && ghToken); }
+  function localStamp(){ try{ return localStorage.getItem(UPDATED_KEY) || ''; }catch(e){ return ''; } }
+  function setLocalStamp(v){ try{ localStorage.setItem(UPDATED_KEY, v); }catch(e){} }
+  function utf8ToB64(str){
+    const bytes = new TextEncoder().encode(str);
+    let bin = ''; const CH = 0x8000;
+    for(let i=0;i<bytes.length;i+=CH) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+CH));
+    return btoa(bin);
+  }
+  function b64ToUtf8(b64){
+    const bin = atob(b64.replace(/\s/g,''));
+    const bytes = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
 
   // ---------- AI assistant state ----------
   const AI_CONFIG_KEY = 'ledger:ai-config';
@@ -750,6 +769,10 @@
 
   function loadCloudConfig(){
     try{
+      const g = JSON.parse(localStorage.getItem(GH_CONFIG_KEY) || 'null');
+      if(g && g.repo && g.token){ ghRepo = g.repo; ghToken = g.token; ghPath = g.path || 'ledger-data.json'; }
+    }catch(e){}
+    try{
       const raw = localStorage.getItem(CLOUD_CONFIG_KEY);
       if(!raw) return;
       const cfg = JSON.parse(raw);
@@ -760,12 +783,14 @@
     localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify({url:cloudUrl, key:cloudAnonKey, code:syncCode}));
   }
   function clearCloudConfig(){
+    ghRepo = null; ghToken = null; ghSha = null;
+    try{ localStorage.removeItem(GH_CONFIG_KEY); }catch(e){}
     cloudUrl = null; cloudAnonKey = null; syncCode = null;
     syncStatus = 'disconnected';
     localStorage.removeItem(CLOUD_CONFIG_KEY);
   }
   function isCloudConfigured(){
-    return !!(cloudUrl && cloudAnonKey && syncCode);
+    return ghConfigured() || !!(cloudUrl && cloudAnonKey && syncCode);
   }
 
   // ---------- AI assistant helpers ----------
@@ -870,8 +895,97 @@
     return text;
   }
 
+  function applyRemoteData(remote){
+    wallets = remote.wallets || [];
+    txs = remote.transactions || [];
+    budgets = remote.budgets || [];
+    goals = remote.goals || [];
+    installmentPlans = remote.installmentPlans || [];
+    settlements = remote.settlements || settlements || [];
+    loans = remote.loans || [];
+    localStorage.setItem(STORE_KEY_W, JSON.stringify(wallets));
+    localStorage.setItem(STORE_KEY_T, JSON.stringify(txs));
+    localStorage.setItem(STORE_KEY_B, JSON.stringify(budgets));
+    localStorage.setItem(STORE_KEY_G, JSON.stringify(goals));
+    localStorage.setItem(STORE_KEY_I, JSON.stringify(installmentPlans));
+    localStorage.setItem(STORE_KEY_S, JSON.stringify(settlements));
+    localStorage.setItem(STORE_KEY_L, JSON.stringify(loans));
+  }
+  function ghRequest(method, bodyObj, raw){
+    const url = 'https://api.github.com/repos/'+ghRepo+'/contents/'+encodeURI(ghPath) + (method==='GET' ? '?t='+Date.now() : '');
+    const headers = {Authorization:'Bearer '+ghToken, Accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28'};
+    if(bodyObj) headers['Content-Type'] = 'application/json';
+    return fetch(url, {method, headers, body: bodyObj ? JSON.stringify(bodyObj) : undefined, cache:'no-store'});
+  }
+  function ghErrorMessage(status){
+    if(status===401 || status===403) return 'GitHub rejected the token — check it has Contents: Read and write on the data repo.';
+    if(status===404) return 'Could not find that repository — check the name and token access.';
+    return 'Could not reach GitHub — your changes are saved on this device and will sync later.';
+  }
+  async function pullFromGitHub(){
+    lastPullAt = Date.now();
+    syncStatus = 'syncing'; render();
+    try{
+      const r = await ghRequest('GET');
+      if(r.status===404){ await pushToGitHub(); return true; }
+      if(!r.ok){ const e = new Error('HTTP '+r.status); e.status = r.status; throw e; }
+      const meta = await r.json();
+      ghSha = meta.sha;
+      let text;
+      if(meta.content && meta.encoding==='base64') text = b64ToUtf8(meta.content);
+      else text = await (await ghRequest('GET', null, true)).text();
+      const remote = JSON.parse(text);
+      const remoteStamp = remote.updatedAt || '';
+      const local = localStamp();
+      if(!local){
+        if(!confirm('GitHub already has saved ledger data (last updated '+(remoteStamp ? new Date(remoteStamp).toLocaleString() : 'unknown')+'). Replace the data on this device with it?')){
+          syncStatus = 'disconnected'; render(); return false;
+        }
+        applyRemoteData(remote); setLocalStamp(remoteStamp || new Date().toISOString());
+      } else if(remoteStamp > local){
+        applyRemoteData(remote); setLocalStamp(remoteStamp);
+      } else if(remoteStamp < local){
+        await pushToGitHub(); return true;
+      }
+      syncStatus = 'synced'; syncError = '';
+      render();
+      return true;
+    }catch(e){
+      syncStatus = 'error'; syncError = ghErrorMessage(e.status);
+      render();
+      return false;
+    }
+  }
+  async function pushToGitHub(){
+    syncStatus = 'syncing'; render();
+    try{
+      if(!ghSha){
+        const g = await ghRequest('GET');
+        if(g.ok) ghSha = (await g.json()).sha;
+        else if(g.status!==404){ const e = new Error('HTTP '+g.status); e.status = g.status; throw e; }
+      }
+      const stamp = localStamp() || new Date().toISOString();
+      setLocalStamp(stamp);
+      const payload = {wallets, transactions:txs, budgets, goals, installmentPlans, settlements, loans, updatedAt:stamp};
+      const body = {message:'Ledger sync '+stamp, content: utf8ToB64(JSON.stringify(payload)), ...(ghSha ? {sha:ghSha} : {})};
+      let res = await ghRequest('PUT', body);
+      if(res.status===409 || res.status===422){
+        ghSha = null;
+        const g = await ghRequest('GET');
+        if(g.ok){ ghSha = (await g.json()).sha; body.sha = ghSha; res = await ghRequest('PUT', body); }
+      }
+      if(!res.ok){ const e = new Error('HTTP '+res.status); e.status = res.status; throw e; }
+      ghSha = (await res.json()).content.sha;
+      syncStatus = 'synced'; syncError = '';
+    }catch(e){
+      syncStatus = 'error'; syncError = ghErrorMessage(e.status);
+    }
+    render();
+  }
+
   async function pullFromCloud(){
     if(!isCloudConfigured()) return false;
+    if(ghConfigured()) return pullFromGitHub();
     syncStatus = 'syncing'; render();
     try{
       const res = await fetch(`${cloudUrl}/rest/v1/ledger_sync?sync_key=eq.${encodeURIComponent(syncCode)}&select=data,updated_at`, {
@@ -880,19 +994,7 @@
       if(!res.ok) throw new Error('HTTP '+res.status);
       const rows = await res.json();
       if(rows && rows.length){
-        const remote = rows[0].data;
-        wallets = remote.wallets || [];
-        txs = remote.transactions || [];
-        budgets = remote.budgets || [];
-        goals = remote.goals || [];
-        installmentPlans = remote.installmentPlans || [];
-        loans = remote.loans || loans || [];
-        localStorage.setItem(STORE_KEY_L, JSON.stringify(loans));
-        localStorage.setItem(STORE_KEY_W, JSON.stringify(wallets));
-        localStorage.setItem(STORE_KEY_T, JSON.stringify(txs));
-        localStorage.setItem(STORE_KEY_B, JSON.stringify(budgets));
-        localStorage.setItem(STORE_KEY_G, JSON.stringify(goals));
-        localStorage.setItem(STORE_KEY_I, JSON.stringify(installmentPlans));
+        applyRemoteData(rows[0].data);
       } else {
         await pushToCloudNow();
       }
@@ -908,11 +1010,12 @@
 
   async function pushToCloudNow(){
     if(!isCloudConfigured()) return;
+    if(ghConfigured()) return pushToGitHub();
     syncStatus = 'syncing'; render();
     try{
       const payload = {
         sync_key: syncCode,
-        data: {wallets, transactions:txs, budgets, goals, installmentPlans, loans},
+        data: {wallets, transactions:txs, budgets, goals, installmentPlans, settlements, loans},
         updated_at: new Date().toISOString()
       };
       const res = await fetch(`${cloudUrl}/rest/v1/ledger_sync?on_conflict=sync_key`, {
@@ -967,7 +1070,7 @@
       goals = g ? JSON.parse(g) : null;
       installmentPlans = i ? JSON.parse(i) : null;
       settlements = s ? JSON.parse(s) : null;
-      if(!wallets && !txs){ seedDemo(); persist(); }
+      if(!wallets && !txs){ seedDemo(); persist(); setLocalStamp(''); }
       if(!wallets) wallets = [];
       if(!txs) txs = [];
       if(!budgets) budgets = [];
@@ -1025,6 +1128,7 @@
     }catch(e){
       console.warn('Could not save — storage may be full or blocked.', e);
     }
+    setLocalStamp(new Date().toISOString());
     schedulePush();
   }
 
@@ -1710,6 +1814,13 @@
             <div class="field"><label>Monthly payment (optional)</label><input type="number" id="ln-monthly" step="0.01" min="0" value="${l&&l.monthlyPayment?l.monthlyPayment:''}"></div>
             <div class="field"><label>Due day of month (optional)</label><input type="number" id="ln-dueday" min="1" max="31" value="${l&&l.dueDay?l.dueDay:''}"></div>
           </div>
+          ${l ? '' : `
+          <div class="checkbox-row"><input type="checkbox" id="ln-receive" checked><label for="ln-receive">Add the borrowed money to a wallet now (not counted as income)</label></div>
+          <div class="form-row">
+            <div class="field"><label>Received in</label><select id="ln-wallet">${wallets.filter(w=>w.type!=='credit').map(w=>`<option value="${w.id}">${escapeHtml(w.name)}</option>`).join('')}</select></div>
+            <div class="field"><label>Date received</label><input type="date" id="ln-date" value="${todayStr()}"></div>
+          </div>
+          <p class="hint" style="margin-top:-4px;">Turn this off if the money is already in your balance, or if you're tracking a loan you took before using the ledger.</p>`}
           <div class="modal-actions"><button class="btn-ghost" id="ln-cancel">Cancel</button><button class="btn-primary" id="ln-save">Save</button></div>
         </div>
       </div>`;
@@ -3000,6 +3111,28 @@
   }
 
   function syncModalHtml(){
+    if(ghConfigured()){
+      const code = encodeSetupCode({gh:{repo:ghRepo, token:ghToken, path:ghPath}});
+      return `
+        <div class="modal-overlay" id="sync-modal-overlay">
+          <div class="modal">
+            <h3>GitHub sync</h3>
+            <p class="hint">Connected to <strong>${escapeHtml(ghRepo)}</strong>. Status: <strong>${syncStatus}</strong>${syncError ? ' — '+escapeHtml(syncError) : ''}</p>
+            <p class="hint">Your phone and computer stay in step: open the app and it pulls the latest, and every change is pushed automatically. If two devices change data at the same time, the most recent change wins.</p>
+            <div class="field" style="margin-bottom:12px;">
+              <label>Setup code for another device (contains your token — keep private)</label>
+              <textarea id="sync-code-display" readonly style="height:70px;resize:none;font-family:var(--mono);font-size:11px;">${code}</textarea>
+            </div>
+            <div class="modal-actions" style="justify-content:space-between;">
+              <button class="btn-ghost" id="sync-disconnect" style="color:var(--rose);border-color:var(--rose);">Disconnect</button>
+              <div style="display:flex;gap:8px;">
+                <button class="btn-ghost" id="sync-modal-close">Close</button>
+                <button class="btn-primary" id="sync-now-btn">Sync now</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
     if(isCloudConfigured()){
       const setupCode = encodeSetupCode({url:cloudUrl, key:cloudAnonKey, code:syncCode});
       return `
@@ -3026,7 +3159,18 @@
     return `
       <div class="modal-overlay" id="sync-modal-overlay">
         <div class="modal">
-          <h3>Set up cloud sync</h3>
+          <h3>Set up sync</h3>
+          <p class="hint"><strong>Sync with a private GitHub repo.</strong> 1) Create a new <em>private</em> repository (e.g. <code>ledger-data</code>). 2) GitHub → Settings → Developer settings → Fine-grained tokens → generate one for <em>only that repo</em> with <em>Contents: Read and write</em>. 3) Enter both below.</p>
+          <div class="field" style="margin-bottom:10px;">
+            <label>Private repo (owner/name)</label>
+            <input type="text" id="gh-repo" placeholder="mishaysabelh/ledger-data" autocapitalize="off" autocorrect="off">
+          </div>
+          <div class="field" style="margin-bottom:10px;">
+            <label>Fine-grained access token</label>
+            <input type="password" id="gh-token" placeholder="github_pat_…" autocomplete="off">
+          </div>
+          <button class="btn-primary" id="gh-connect-btn" style="width:100%;">Connect GitHub</button>
+          <details class="dc-details" style="margin-top:14px;"><summary>Use Supabase instead</summary>
           <p class="hint">Uses a free Supabase project as private storage. Create one at supabase.com, run the setup SQL once, then fill this in.</p>
           <div class="field" style="margin-bottom:10px;">
             <label>Supabase project URL</label>
@@ -3047,6 +3191,7 @@
             <button class="btn-ghost" id="sync-modal-close">Cancel</button>
             <button class="btn-primary" id="sync-connect-btn">Connect</button>
           </div>
+          </details>
           <div style="border-top:1px dashed var(--border);margin-top:16px;padding-top:14px;">
             <div class="field" style="margin-bottom:8px;">
               <label>Or paste a setup code from another device</label>
@@ -3285,7 +3430,13 @@
           const l = loans.find(x=>x.id===loanModal.id);
           if(l) Object.assign(l, {name, principal, paidBefore, monthlyPayment, dueDay});
         } else {
-          loans.push({id:uid(), name, principal, paidBefore, monthlyPayment, dueDay, createdAt:todayStr()});
+          const newLoan = {id:uid(), name, principal, paidBefore, monthlyPayment, dueDay, createdAt:todayStr()};
+          loans.push(newLoan);
+          const recv = document.getElementById('ln-receive');
+          const wId = document.getElementById('ln-wallet') && document.getElementById('ln-wallet').value;
+          if(recv && recv.checked && wId){
+            txs.push({id:uid(), walletId:wId, type:'income', amount:principal, category:'borrowed_in', note:'Loan from '+name, date:(document.getElementById('ln-date').value||todayStr()), loanId:newLoan.id, loanReceived:true});
+          }
         }
         loanModal = null; persist(); render();
       });
@@ -3696,10 +3847,35 @@
         render();
       });
 
+      const ghConnectBtn = document.getElementById('gh-connect-btn');
+      if(ghConnectBtn) ghConnectBtn.addEventListener('click', async ()=>{
+        const repo = document.getElementById('gh-repo').value.trim().replace(/^https?:\/\/github\.com\//,'').replace(/\.git$/,'').replace(/\/$/,'');
+        const token = document.getElementById('gh-token').value.trim();
+        if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !token){ alert('Enter the repo as owner/name and paste the token.'); return; }
+        ghConnectBtn.disabled = true; ghConnectBtn.textContent = 'Checking…';
+        try{
+          const info = await fetch('https://api.github.com/repos/'+repo, {headers:{Authorization:'Bearer '+token, Accept:'application/vnd.github+json'}});
+          if(!info.ok){ alert(ghErrorMessage(info.status)); ghConnectBtn.disabled=false; ghConnectBtn.textContent='Connect GitHub'; return; }
+          const meta = await info.json();
+          if(!meta.private){ alert('That repository is public — your finances would be visible to everyone. Create a private repository and use that instead.'); ghConnectBtn.disabled=false; ghConnectBtn.textContent='Connect GitHub'; return; }
+        }catch(e){ alert('Could not reach GitHub — check your connection.'); ghConnectBtn.disabled=false; ghConnectBtn.textContent='Connect GitHub'; return; }
+        ghRepo = repo; ghToken = token; ghPath = 'ledger-data.json'; ghSha = null;
+        try{ localStorage.setItem(GH_CONFIG_KEY, JSON.stringify({repo:ghRepo, token:ghToken, path:ghPath})); }catch(e){}
+        showSyncModal = false;
+        await pullFromGitHub();
+      });
+
       const pasteConnectBtn = document.getElementById('sync-paste-connect-btn');
       if(pasteConnectBtn) pasteConnectBtn.addEventListener('click', async ()=>{
         const raw = document.getElementById('sync-paste-input').value.trim();
         const decoded = decodeSetupCode(raw);
+        if(decoded && decoded.gh && decoded.gh.repo && decoded.gh.token){
+          ghRepo = decoded.gh.repo; ghToken = decoded.gh.token; ghPath = decoded.gh.path || 'ledger-data.json'; ghSha = null;
+          try{ localStorage.setItem(GH_CONFIG_KEY, JSON.stringify({repo:ghRepo, token:ghToken, path:ghPath})); }catch(e){}
+          showSyncModal = false;
+          await pullFromGitHub();
+          return;
+        }
         if(!decoded || !decoded.url || !decoded.key || !decoded.code){ alert('That code could not be read — check it was copied in full.'); return; }
         cloudUrl = decoded.url; cloudAnonKey = decoded.key; syncCode = decoded.code;
         saveCloudConfig();
@@ -3713,7 +3889,7 @@
 
       const disconnectBtn = document.getElementById('sync-disconnect');
       if(disconnectBtn) disconnectBtn.addEventListener('click', ()=>{
-        if(!confirm('Disconnect cloud sync on this device? Your data stays in the cloud and stays here locally — this just stops this device from syncing.')) return;
+        if(!confirm('Disconnect sync on this device? Your data stays in the cloud and stays here locally — this just stops this device from syncing.')) return;
         clearCloudConfig();
         showSyncModal = false;
         render();
@@ -4342,6 +4518,13 @@ ${budgetLines}`;
     if((e.key==='Enter' || e.key===' ') && e.target && e.target.getAttribute && e.target.getAttribute('role')==='button' && !/^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(e.target.tagName)){
       e.preventDefault(); e.target.click();
     }
+  });
+
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden || !ghConfigured() || isLocked) return;
+    if(Date.now() - lastPullAt < 20000) return;
+    if(root.querySelector('.modal-overlay')) return;
+    pullFromGitHub();
   });
 
   loadData();
