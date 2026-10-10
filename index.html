@@ -938,7 +938,7 @@
       const remoteStamp = remote.updatedAt || '';
       const local = localStamp();
       if(!local){
-        if(!confirm('GitHub already has saved ledger data (last updated '+(remoteStamp ? new Date(remoteStamp).toLocaleString() : 'unknown')+'). Replace the data on this device with it?')){
+        if(wallets.length && !confirm('GitHub already has saved ledger data (last updated '+(remoteStamp ? new Date(remoteStamp).toLocaleString() : 'unknown')+'). Replace the data on this device with it?')){
           syncStatus = 'disconnected'; render(); return false;
         }
         applyRemoteData(remote); setLocalStamp(remoteStamp || new Date().toISOString());
@@ -1070,7 +1070,7 @@
       goals = g ? JSON.parse(g) : null;
       installmentPlans = i ? JSON.parse(i) : null;
       settlements = s ? JSON.parse(s) : null;
-      if(!wallets && !txs){ seedDemo(); persist(); setLocalStamp(''); }
+      // a brand-new device starts empty (no sample data) — the arrays are defaulted just below
       if(!wallets) wallets = [];
       if(!txs) txs = [];
       if(!budgets) budgets = [];
@@ -1102,7 +1102,7 @@
         tx.category = original.loaned ? 'repayment_in' : 'reimbursement_in';
       });
     }catch(e){
-      seedDemo();
+      wallets = []; txs = []; budgets = []; goals = []; installmentPlans = []; settlements = []; loans = [];
     }
     loaded = true;
     render();
@@ -2091,6 +2091,15 @@
           </div>
         </div>
 
+        ${(!wallets.length && !txs.length) ? `
+        <div class="panel" style="margin-bottom:18px;">
+          <h2>Welcome to your ledger</h2>
+          <p class="hint" style="margin-top:-4px;">It's empty and ready for your real numbers. Start by adding a wallet (cash, bank, card…) with its current balance, then log entries as you go.</p>
+          <div class="ai-btn-row">
+            <button class="btn-primary" id="welcome-add-wallet">+ Add your first wallet</button>
+            <span class="hint" style="align-self:center;margin:0;">Already have a backup? Use <strong>Import</strong> above, or <strong>Set up cloud sync</strong> to pull it from GitHub.</span>
+          </div>
+        </div>` : ''}
         <div class="panel liquidity-panel-outer">
           <div class="liquidity-panel">
             <div class="liquidity-figure">
@@ -3471,6 +3480,8 @@
     const toggleLoanFilter = document.getElementById('toggle-loan-filter');
     if(toggleLoanFilter) toggleLoanFilter.addEventListener('click', ()=>{ ledgerFilter = ledgerFilter==='loan' ? null : 'loan'; render(); });
 
+    const welcomeAdd = document.getElementById('welcome-add-wallet');
+    if(welcomeAdd) welcomeAdd.addEventListener('click', ()=>{ showAddWallet = true; render(); });
     const addWalletBtn = document.getElementById('add-wallet-btn');
     if(addWalletBtn) addWalletBtn.addEventListener('click', ()=>{ showAddWallet = true; render(); });
 
